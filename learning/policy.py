@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import logging
+import math
 
 import torch
 import transformers
@@ -29,6 +30,12 @@ class TransformerLMPolicy(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.config = config
+        self.alpha = config.get('alpha', 0.)
+        self.alpha_schedule = config.get('alpha_schedule', 'constant')
+        self.total_iterations = config.total_iterations
+        self.normalize_loss = config.get('normalize_loss', False)
+
         if torch.cuda.is_available():
             cfg = transformers.GPT2Config(
                 vocab_size=128,
@@ -53,6 +60,8 @@ class TransformerLMPolicy(nn.Module):
                 n_positions=512)
             device = torch.device('cpu')
 
+        self._batch_size = config.get('batch_size', 1000)
+        self._train_batches = config.get('train_iterations', 1000)
         self._lm = transformers.GPT2LMHeadModel(cfg).to(device)
         self._optimizer = torch.optim.AdamW(self._lm.parameters(), lr=config.get('lr', 1e-4))
 
@@ -63,20 +72,38 @@ class TransformerLMPolicy(nn.Module):
         attn_mask = input_ids != PAD
         return self._lm.forward(input_ids, attention_mask=attn_mask, labels=labels).loss
 
-    def fit(self, examples, batch_size, n_steps, verbose=False):
+    def val_loss(self, val_set):
+        self._lm.eval()
+        loss = self.get_loss(val_set).item()
+        return loss
+
+    def fit(self, examples, final_goals, iteration, ratio_proven, verbose=False):
         self._lm.train()
 
-        rng = range(n_steps)
+        rng = range(self._train_batches)
 
         if verbose:
             rng = tqdm(rng)
 
         for i in rng:
-            b = sample_batch(examples, batch_size)
+            b = sample_batch(examples, self._batch_size)
+            if len(b) == 0:
+                continue
             self._optimizer.zero_grad()
-            loss = self.get_loss(b)
+            # find alpha parameter
+            alpha = self.get_alpha(iteration, i, ratio_proven)
+            # calculate standard transformer loss 
+            train_loss = self.get_loss(b) 
+            # measure progress towards goal
+            progress_loss = self.get_loss(final_goals) 
+
+            if self.normalize_loss:
+                loss = (1. - alpha) * train_loss + alpha * progress_loss 
+            else:
+                loss = train_loss + alpha * progress_loss 
+
             loss.backward()
-            wandb.log({'train_loss': loss})
+            wandb.log({'train_loss': train_loss, 'loss': loss, 'progress_loss': progress_loss, 'alpha': alpha})
             self._optimizer.step()
 
         self._lm.eval()
@@ -100,6 +127,24 @@ class TransformerLMPolicy(nn.Module):
         self._lm.eval()
 
         return return_value
+
+    def get_alpha(self, iteration, step, conjectures_proved_ratio):
+
+        total_steps = self.total_iterations * self._train_batches - 1
+        i = iteration * self._train_batches + step
+
+        if self.alpha_schedule == 'constant':
+            return self.alpha
+        elif self.alpha_schedule == 'linear':
+            return self.alpha * (i / total_steps)
+        elif self.alpha_schedule == 'quadratic':
+            return self.alpha * ((i / total_steps) ** 2)
+        elif self.alpha_schedule == 'cubic':
+            return self.alpha * ((i / total_steps) ** 3)
+        elif self.alpha_schedule == 'cos':
+            return self.alpha * (1 + math.cos(math.pi * (i / total_steps-1))) / 2
+        elif self.alpha_schedule == 'ratio' and conjectures_proved_ratio is not None:
+            return self.alpha * conjectures_proved_ratio
 
     def estimate_state_values(self, states: list[str]) -> np.array:
         return self._estimate_query_values([self.format_state_query(s) for s in states])

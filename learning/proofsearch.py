@@ -659,9 +659,6 @@ class LMPolicy(Policy):
         self._lm = policy.TransformerLMPolicy(config)
         self._value_prior_weight = config.get('value_prior_weight', 1)
         self._max_positive_negative_ratio = config.get('max_positive_negative_ratio', 10)
-        self._optimizer = torch.optim.AdamW(self._lm.parameters(), lr=config.get('lr', 1e-4))
-        self._train_batches = config.get('train_iterations', 1000)
-        self._batch_size = config.get('batch_size', 1000)
         self._lm.eval()
 
     def evaluate(self, node: TreeSearchNode) -> np.array:
@@ -795,9 +792,11 @@ class LMPolicy(Policy):
 
         return examples
 
+    def val_loss(self, val_set):
+        return self._lm.val_loss(val_set)
 
-    def train(self, examples, verbose=True):
-        self._lm.fit(examples, self._batch_size, self._train_batches, verbose)
+    def train(self, examples, final_goals, iteration, ratio_proven, verbose=True):
+        self._lm.fit(examples, final_goals, iteration, ratio_proven, verbose)
         self._lm.eval()
 
 
@@ -967,15 +966,16 @@ class ProofSearchResult:
 
 class ProofSearchAgent:
     def __init__(self, config: DictConfig):
+        agent_config = config.agent
         self.config = config
-        self._max_mcts_nodes = config.get('max_mcts_nodes', 1000)
-        self._max_searches = config.get('max_searches', 1)
-        self._max_examples = config.get('max_examples', 10**8)
-        self._checkpoint_every = config.get('checkpoint_every', 1000)
-        self._policy = make_policy(config.policy)
+        self._max_mcts_nodes = agent_config.get('max_mcts_nodes', 1000)
+        self._max_searches = agent_config.get('max_searches', 1)
+        self._max_examples = agent_config.get('max_examples', 10**8)
+        self._checkpoint_every = agent_config.get('checkpoint_every', 1000)
+        self._policy = make_policy(agent_config.policy)
         self._node_type = ({'vanilla': LeftmostFirstSearchNode,
-                            'holophrasm': HolophrasmNode})[config.get('node_type', 'holophrasm')]
-        self._checkpoint_dir = config.get('checkpoint_dir', 'checkpoints')
+                            'holophrasm': HolophrasmNode})[agent_config.get('node_type', 'holophrasm')]
+        self._checkpoint_dir = agent_config.get('checkpoint_dir', 'checkpoints')
         self._training_its = 0
         self._checkpoints = 0
         self._examples = []
@@ -1020,7 +1020,7 @@ class ProofSearchAgent:
 
         return ProofSearchResult(problem, solved, root, examples, iterations)
 
-    def train(self, examples=None):
+    def train(self, examples, final_goals, solutions, iteration, ratio_proven): 
         examples = examples or self._examples
 
         if self._training_its % self._checkpoint_every == 0:
@@ -1037,7 +1037,15 @@ class ProofSearchAgent:
                 else:
                     assert isinstance(e, str), f'{type(e)} is not a string.'
                     example_strs.append(e)
-            self._policy.train(example_strs)
+
+            # train policy
+            self._policy.train(example_strs, final_goals, iteration, ratio_proven)
+
+            # calculate validation loss
+            # https://stackoverflow.com/questions/952914/how-do-i-make-a-flat-list-out-of-a-list-of-lists
+            solutions_flattened = [x for xs in solutions for x in xs]
+            val_loss = self._policy.val_loss(solutions_flattened)
+            wandb.log({'val_loss': val_loss})
 
         self._training_its += 1
 
@@ -1297,7 +1305,7 @@ def make_agent(config):
         import pretraining
         agent = pretraining.CuriosityGuidedProofSearchAgent(config.agent)
     else:
-        agent = ProofSearchAgent(config.agent)
+        agent = ProofSearchAgent(config)
 
     if config.agent.get('lm_path'):
         path = config.agent.get('lm_path')
